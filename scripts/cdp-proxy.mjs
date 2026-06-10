@@ -22,6 +22,16 @@ function parseBrowserArg() {
 }
 const BROWSER_OVERRIDE = parseBrowserArg();
 
+function parseCdpUrlArg() {
+  const argv = process.argv.slice(2);
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--cdp-url' && argv[i + 1]) return argv[i + 1];
+    if (argv[i].startsWith('--cdp-url=')) return argv[i].slice('--cdp-url='.length);
+  }
+  return null;
+}
+const DIRECT_CDP_URL = parseCdpUrlArg() || process.env.WEB_ACCESS_CDP_URL || null;
+
 const PORT = parseInt(process.env.CDP_PROXY_PORT || '3456');
 let ws = null;
 let cmdId = 0;
@@ -53,9 +63,82 @@ let connectedBrowser = null; // { id, label, source }
 // pin 首次成功连接的浏览器 id。重连时只接受同一 id，避免悄悄降级到别的浏览器。
 let pinnedBrowserId = null;
 
+function isDirectCdpUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    return url.protocol === 'http:' || url.protocol === 'https:' || url.protocol === 'ws:' || url.protocol === 'wss:';
+  } catch {
+    return false;
+  }
+}
+
+async function resolveDirectCdpWebSocketUrl(rawUrl) {
+  if (!rawUrl) throw new Error('缺少直连 CDP URL');
+  if (!isDirectCdpUrl(rawUrl)) {
+    throw new Error(`无效的 CDP URL: ${rawUrl}`);
+  }
+
+  const url = new URL(rawUrl);
+  if (url.protocol === 'ws:' || url.protocol === 'wss:') {
+    return url.toString();
+  }
+
+  if (url.pathname.endsWith('/json/list')) {
+    const versionUrl = new URL(url);
+    versionUrl.pathname = versionUrl.pathname.replace(/\/json\/list$/, '/json/version');
+    try {
+      const versionResp = await fetch(versionUrl);
+      if (versionResp.ok) {
+        const versionJson = await versionResp.json();
+        if (versionJson?.webSocketDebuggerUrl) return versionJson.webSocketDebuggerUrl;
+      }
+    } catch {}
+
+    const listResp = await fetch(url);
+    if (!listResp.ok) {
+      throw new Error(`无法读取 CDP discovery URL: ${rawUrl}`);
+    }
+    const targets = await listResp.json();
+    const firstPage = Array.isArray(targets)
+      ? targets.find(t => t?.type === 'page' && t?.webSocketDebuggerUrl) || targets[0]
+      : null;
+    if (firstPage?.webSocketDebuggerUrl) return firstPage.webSocketDebuggerUrl;
+    throw new Error(`CDP discovery 返回中没有 webSocketDebuggerUrl: ${rawUrl}`);
+  }
+
+  if (url.pathname.endsWith('/json/version')) {
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      throw new Error(`无法读取 CDP version URL: ${rawUrl}`);
+    }
+    const json = await resp.json();
+    if (json?.webSocketDebuggerUrl) return json.webSocketDebuggerUrl;
+    throw new Error(`CDP version 返回中没有 webSocketDebuggerUrl: ${rawUrl}`);
+  }
+
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    throw new Error(`无法读取 CDP URL: ${rawUrl}`);
+  }
+  const json = await resp.json();
+  if (json?.webSocketDebuggerUrl) return json.webSocketDebuggerUrl;
+  if (Array.isArray(json)) {
+    const first = json.find(t => t?.webSocketDebuggerUrl);
+    if (first?.webSocketDebuggerUrl) return first.webSocketDebuggerUrl;
+  }
+  throw new Error(`CDP URL 未返回 webSocketDebuggerUrl: ${rawUrl}`);
+}
+
 // --- 自动发现浏览器调试端口 ---
 // 决策完全委派给 browser-discovery.selectBrowser；此处只做日志和返回结构包装。
 async function discoverChromePort() {
+  if (DIRECT_CDP_URL) {
+    const wsUrl = await resolveDirectCdpWebSocketUrl(DIRECT_CDP_URL);
+    connectedBrowser = { id: 'direct-cdp', label: 'Direct CDP profile', source: 'direct', cdpUrl: DIRECT_CDP_URL };
+    console.log(`[CDP Proxy] 直连 CDP: ${DIRECT_CDP_URL}`);
+    return { directWsUrl: wsUrl };
+  }
+
   const result = await selectBrowser(BROWSER_OVERRIDE);
   if (result.kind === 'ok') {
     if (pinnedBrowserId && pinnedBrowserId !== result.browser.id) {
@@ -89,7 +172,7 @@ async function discoverChromePort() {
       `若想换成其他浏览器，请先在终端运行 pkill -f cdp-proxy.mjs 重置。`
     );
   }
-  // 仅在「从未成功连接 + 无偏好/override」时允许固定端口兜底（手动 --remote-debugging-port 启动场景）
+  // 仅在「从未成功连接 + 无偏好/override」时允许候选端口兜底（手动 --remote-debugging-port 启动场景）
   const fallbackPort = await findFallbackPort();
   if (fallbackPort !== null) {
     connectedBrowser = { id: 'unknown', label: '未知（通过手动调试端口连接）', source: 'fallback' };
@@ -107,13 +190,14 @@ function getWebSocketUrl(port, wsPath) {
 // --- WebSocket 连接管理 ---
 let chromePort = null;
 let chromeWsPath = null;
+let directWsUrl = null;
 
 let connectingPromise = null;
 async function connect() {
   if (ws && (ws.readyState === WS.OPEN || ws.readyState === 1)) return;
   if (connectingPromise) return connectingPromise;  // 复用进行中的连接
 
-  if (!chromePort) {
+  if (!chromePort && !chromeWsPath && !directWsUrl) {
     const discovered = await discoverChromePort();
     if (!discovered) {
       throw new Error(
@@ -123,11 +207,12 @@ async function connect() {
         '  或在 chrome://flags 中搜索 "remote debugging" 并启用'
       );
     }
-    chromePort = discovered.port;
-    chromeWsPath = discovered.wsPath;
+    chromePort = discovered.port ?? null;
+    chromeWsPath = discovered.wsPath ?? null;
+    directWsUrl = discovered.directWsUrl ?? null;
   }
 
-  const wsUrl = getWebSocketUrl(chromePort, chromeWsPath);
+  const wsUrl = directWsUrl || getWebSocketUrl(chromePort, chromeWsPath);
   if (!wsUrl) throw new Error('无法获取 Chrome WebSocket URL');
 
   return connectingPromise = new Promise((resolve, reject) => {
@@ -145,6 +230,7 @@ async function connect() {
       ws = null;
       chromePort = null;
       chromeWsPath = null;
+      directWsUrl = null;
       const msg = e.message || e.error?.message || '连接失败';
       console.error('[CDP Proxy] 连接错误:', msg, '（端口缓存已清除，下次将重新发现）');
       reject(new Error(msg));
@@ -154,6 +240,7 @@ async function connect() {
       ws = null;
       chromePort = null; // 重置端口缓存，下次连接重新发现
       chromeWsPath = null;
+      directWsUrl = null;
       sessions.clear();
       managedTabs.clear();
     };

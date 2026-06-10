@@ -4,11 +4,12 @@
 // 用法：
 //   node check-deps.mjs                  默认行为：读 config.env 偏好
 //   node check-deps.mjs --browser edge   本次临时指定浏览器（不写 config.env）
+//   node check-deps.mjs --cdp-url ...    直连一个已知的 CDP discovery / websocket URL
 //
 // 持久偏好 → config.env (skill 根目录, gitignored)
 // 单次覆盖 → --browser 命令行参数（全链路 argv，不碰 process.env）
 
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -24,10 +25,12 @@ const CONFIG_TEMPLATE = path.join(ROOT, 'templates', 'config.env.template');
 // --- 参数解析 ---
 
 function parseArgs(argv) {
-  const opts = { browser: null };
+  const opts = { browser: null, cdpUrl: null };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--browser' && argv[i + 1]) { opts.browser = argv[i + 1]; i++; }
     else if (argv[i].startsWith('--browser=')) { opts.browser = argv[i].slice('--browser='.length); }
+    else if (argv[i] === '--cdp-url' && argv[i + 1]) { opts.cdpUrl = argv[i + 1]; i++; }
+    else if (argv[i].startsWith('--cdp-url=')) { opts.cdpUrl = argv[i].slice('--cdp-url='.length); }
   }
   return opts;
 }
@@ -61,11 +64,12 @@ function httpGetJson(url, timeoutMs = 3000) {
     .catch(() => null);
 }
 
-function startProxyDetached(browserOverride) {
+function startProxyDetached(browserOverride, cdpUrl) {
   const logFile = path.join(os.tmpdir(), 'cdp-proxy.log');
   const logFd = fs.openSync(logFile, 'a');
   const args = [PROXY_SCRIPT];
   if (browserOverride) args.push('--browser', browserOverride);
+  if (cdpUrl) args.push('--cdp-url', cdpUrl);
   const child = spawn(process.execPath, args, {
     detached: true,
     stdio: ['ignore', logFd, logFd],
@@ -75,26 +79,76 @@ function startProxyDetached(browserOverride) {
   fs.closeSync(logFd);
 }
 
-async function ensureProxy(expectedBrowserId, browserOverride) {
+function stopProxyProcess() {
+  if (os.platform() === 'win32') {
+    const script = [
+      "Get-CimInstance Win32_Process",
+      " | Where-Object { $_.CommandLine -like '*cdp-proxy.mjs*' }",
+      " | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }",
+    ].join('');
+    spawnSync('powershell', ['-NoProfile', '-Command', script], { stdio: 'ignore' });
+    return;
+  }
+  spawnSync('pkill', ['-f', 'cdp-proxy.mjs'], { stdio: 'ignore' });
+}
+
+async function ensureProxy(expectedBrowserId, browserOverride, cdpUrl) {
   const healthUrl = `http://127.0.0.1:${PROXY_PORT}/health`;
   const targetsUrl = `http://127.0.0.1:${PROXY_PORT}/targets`;
 
   // 复用：proxy 已运行 + 已连接浏览器 → 校验 expected vs actual
   const health = await httpGetJson(healthUrl);
-  if (health?.status === 'ok' && health.connected) {
+  if (cdpUrl) {
+    if (health?.status === 'ok' && health.browser?.source === 'direct' && health.browser?.cdpUrl === cdpUrl && health.connected) {
+      const runningLabel = health.browser?.label || health.browser?.id || 'unknown';
+      console.log(`proxy: ready (${runningLabel})`);
+      return true;
+    }
+    if (health?.status === 'ok') {
+      const runningLabel = health.browser?.label || health.browser?.id || 'unknown';
+      console.log(`proxy: replacing existing proxy (${runningLabel}) -> direct CDP`);
+      stopProxyProcess();
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  } else if (health?.status === 'ok' && health.connected) {
     const runningId = health.browser?.id;
     const runningLabel = health.browser?.label || runningId || 'unknown';
     if (expectedBrowserId && runningId && runningId !== 'unknown' && runningId !== expectedBrowserId) {
-      console.log(`proxy: 浏览器不一致 — 当前已连着 ${runningLabel}，但本次需要 ${expectedBrowserId}`);
-      console.log('  请在终端运行 pkill -f cdp-proxy.mjs 重置后再试');
+      console.log(`proxy: browser mismatch — currently connected to ${runningLabel}, but this run needs ${expectedBrowserId}`);
+      console.log('  Please run pkill -f cdp-proxy.mjs and try again');
       return false;
     }
     console.log(`proxy: ready (${runningLabel})`);
     return true;
   }
 
+  if (cdpUrl) {
+    console.log('proxy: connecting...');
+    startProxyDetached(browserOverride, cdpUrl);
+
+    await new Promise((r) => setTimeout(r, 2000));
+
+    for (let i = 1; i <= 15; i++) {
+      const result = await httpGetJson(targetsUrl, 8000);
+      if (Array.isArray(result)) {
+        const newHealth = await httpGetJson(healthUrl);
+        const label = newHealth?.browser?.label || 'unknown';
+        console.log(`proxy: ready (${label})`);
+        return true;
+      }
+      if (i === 1) {
+        console.log('⚠️  浏览器可能有授权弹窗，请点击「允许」后等待连接...');
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+
+    console.log('❌ 连接超时，请检查浏览器调试设置');
+    console.log(`  日志：${path.join(os.tmpdir(), 'cdp-proxy.log')}`);
+    return false;
+  }
+
   console.log('proxy: connecting...');
-  startProxyDetached(browserOverride);
+  startProxyDetached(browserOverride, cdpUrl);
 
   await new Promise((r) => setTimeout(r, 2000));
 
@@ -130,7 +184,13 @@ function printAvailableHint(detected) {
   }
 }
 
-async function resolveAndReport(override) {
+async function resolveAndReport(override, cdpUrl) {
+  if (cdpUrl) {
+    console.log(`cdp: ok (direct URL)`);
+    console.log(`  目标：${cdpUrl}`);
+    return { proceed: true, browserId: null };
+  }
+
   const result = await selectBrowser(override);
 
   switch (result.kind) {
@@ -164,7 +224,7 @@ async function resolveAndReport(override) {
     }
 
     case 'empty': {
-      // 末路兜底：尝试常见固定端口（用户手动 --remote-debugging-port=9222 启动的场景）
+      // 末路兜底：尝试常见候选端口（用户手动 --remote-debugging-port 启动的场景）
       const fallbackPort = await findFallbackPort();
       if (fallbackPort) {
         console.log(`browser: ok (port ${fallbackPort}) [通过手动调试端口连接]`);
@@ -185,10 +245,10 @@ async function main() {
   ensureConfigExists();
   checkNode();
 
-  const { proceed, exitCode, browserId } = await resolveAndReport(opts.browser);
+  const { proceed, exitCode, browserId } = await resolveAndReport(opts.browser, opts.cdpUrl || process.env.WEB_ACCESS_CDP_URL || null);
   if (!proceed) process.exit(exitCode);
 
-  const proxyOk = await ensureProxy(browserId, opts.browser);
+  const proxyOk = await ensureProxy(browserId, opts.browser, opts.cdpUrl || process.env.WEB_ACCESS_CDP_URL || null);
   if (!proxyOk) process.exit(1);
 
   // 列出已有站点经验

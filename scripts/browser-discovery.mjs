@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 
 const SKILL_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIG_PATH = path.join(SKILL_ROOT, 'config.env');
+const DEFAULT_FALLBACK_PORT_SPEC = '9222-9235,9333-';
 
 // 已知支持 chrome://inspect#remote-debugging toggle 的浏览器
 // 加新浏览器：只改这里
@@ -94,6 +95,36 @@ async function detectAll() {
   return result;
 }
 
+function parsePortSpec(spec) {
+  const ports = new Set();
+  for (const rawToken of String(spec || '').split(/[\s,]+/)) {
+    const token = rawToken.trim();
+    if (!token) continue;
+
+    const rangeMatch = token.match(/^(\d+)-(\d+)$/);
+    if (rangeMatch) {
+      const start = Number(rangeMatch[1]);
+      const end = Number(rangeMatch[2]);
+      if (!Number.isInteger(start) || !Number.isInteger(end)) continue;
+      const lo = Math.max(1, Math.min(start, end));
+      const hi = Math.min(65535, Math.max(start, end));
+      for (let port = lo; port <= hi; port++) ports.add(port);
+      continue;
+    }
+
+    if (/^\d+$/.test(token)) {
+      const port = Number(token);
+      if (port > 0 && port < 65536) ports.add(port);
+    }
+  }
+  return [...ports].sort((a, b) => a - b);
+}
+
+function getFallbackPorts() {
+  const spec = process.env.WEB_ACCESS_FALLBACK_PORTS || DEFAULT_FALLBACK_PORT_SPEC;
+  return parsePortSpec(spec);
+}
+
 // 决策入口
 // 参数：override — 调用方解析自命令行 --browser 的值（null 表示未传）
 // 返回 { kind, browser?, source?, detected, configured, override? }
@@ -127,12 +158,20 @@ export async function selectBrowser(override = null) {
   return { kind: 'ambiguous', detected, configured };
 }
 
-// 兜底：扫描常用固定端口
-// 适用场景：用户手动 --remote-debugging-port=9222 启动浏览器，
+// 兜底：扫描常用候选端口
+// 适用场景：用户手动 --remote-debugging-port 启动浏览器，
 // 此时 DevToolsActivePort 可能不在默认 user-data-dir。
 export async function findFallbackPort() {
-  for (const port of [9222, 9229, 9333]) {
-    if (await checkPort(port)) return port;
+  const ports = getFallbackPorts();
+  const batchSize = Number(process.env.WEB_ACCESS_FALLBACK_BATCH || 12);
+
+  for (let i = 0; i < ports.length; i += batchSize) {
+    const batch = ports.slice(i, i + batchSize);
+    const results = await Promise.all(
+      batch.map(async (port) => ({ port, ok: await checkPort(port) }))
+    );
+    const hit = results.find((result) => result.ok);
+    if (hit) return hit.port;
   }
   return null;
 }
