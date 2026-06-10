@@ -29,6 +29,14 @@ node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs"
 
 支持参数 `--browser <chrome|edge>` 表达本次临时覆盖（不写 config.env）。
 
+如果你已经拿到了一个 profile 的 `cdp_url`，比如 CloakBrowser Manager MCP 返回的 `http://127.0.0.1:5100/json/list`，可以直接用：
+
+```bash
+node "${CLAUDE_SKILL_DIR}/scripts/check-deps.mjs" --cdp-url "http://127.0.0.1:5100/json/list"
+```
+
+也可以把它写进 `${CLAUDE_SKILL_DIR}/config.env` 的 `WEB_ACCESS_CDP_URL`，让 skill 每次直连这个 profile。
+
 切换浏览器时，proxy 是长驻进程，需先 `pkill -f cdp-proxy.mjs` 再重跑 check-deps。
 
 检查通过后并必须在回复中向用户直接展示以下须知，再启动 CDP Proxy 执行操作：
